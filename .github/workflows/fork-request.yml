@@ -13,9 +13,8 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: fork-request
-  cancel-in-progress: false
+# ワークフロー全体の concurrency は置かない。置くと、承認待ちの申請が1件あるだけで後の申請がすべて順番待ちになる。
+# 残る課題：非公開のフォーク元を同時に2件処理すると、先に終わった側がフォークを無効に戻し、後の側が失敗しうる。
 
 jobs:
   check:
