@@ -52,6 +52,7 @@ jobs:
           inst=$(api "https://api.github.com/orgs/$ORG/installation" | jq -r .id)
           tok=$(api -X POST "https://api.github.com/app/installations/$inst/access_tokens" | jq -r .token)
           echo "::add-mask::$tok"
+          echo "token=$tok" >> "$GITHUB_OUTPUT"
           code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/orgs/$ORG/members/$REQUESTER")
           echo "Org への問い合わせの応答：$code"
@@ -101,6 +102,62 @@ jobs:
           print("確かめた値:", v)
           print("問題:", err or "なし")
           PY
+
+      # 承認者が実行の画面だけで判断できるよう、使う値と権限を受ける人を要約と Issue に書き出す。
+      # 承認の判断は Issue の今の本文ではなく、この表で行う（本文は後から書き換えられるが、処理に使うのは申請したときの本文）。
+      - name: 承認者向けの要約を書く
+        env:
+          GH_TOKEN: ${{ steps.member.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          REQUESTER: ${{ github.event.issue.user.login }}
+          IS_MEMBER: ${{ steps.member.outputs.is_member }}
+          SOURCE: ${{ steps.parse.outputs.source }}
+          FORK: ${{ steps.parse.outputs.fork_name }}
+          TEAM: ${{ steps.parse.outputs.team }}
+          ROLE: ${{ steps.parse.outputs.requester_role }}
+          EXPIRES: ${{ steps.parse.outputs.expires }}
+          ERR: ${{ steps.parse.outputs.error }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/summary.md"
+          src_info="無し"
+          if [ -n "$SOURCE" ]; then
+            src_info=$(gh api "repos/$ORG/$SOURCE" --jq '"\(.visibility)、既定のブランチ \(.default_branch)"' 2>/dev/null || echo "見つからない")
+          fi
+          fork_exists="無し"
+          if [ -n "$FORK" ] && gh api "repos/$ORG/$FORK" >/dev/null 2>&1; then fork_exists="同じ名前のリポジトリがすでにある"; fi
+          members="（チームが見つからない）"
+          if [ -n "$TEAM" ] && m=$(gh api "orgs/$ORG/teams/$TEAM/members?per_page=100" --jq '[.[].login] | join("、")' 2>/dev/null); then
+            members="${m:-（メンバー無し）}"
+          fi
+          forks=$(gh api "repos/$ORG/$SOURCE/forks" --jq '[.[] | select(.owner.login == env.ORG) | .name] | join("、")' 2>/dev/null)
+          {
+            echo "## フォークの申請の確かめ"
+            echo
+            if [ -n "$ERR" ]; then echo "差し戻し：$ERR"; else echo "書式と申請者の確かめは通りました。下の表で中身を確かめてから承認してください。"; fi
+            echo
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| 申請者 | $REQUESTER（Org のメンバー：$IS_MEMBER） |"
+            echo "| フォーク元 | $ORG/$SOURCE（$src_info） |"
+            echo "| フォークの名前 | $ORG/$FORK（$fork_exists） |"
+            echo "| 書き込みの権限を受けるチーム | $TEAM |"
+            echo "| チームのメンバー | $members |"
+            echo "| 申請者に付ける権限 | $ROLE |"
+            echo "| 使う期限 | $EXPIRES |"
+            echo "| この Org にある同じフォーク元のフォーク | ${forks:-無し} |"
+            echo "| 承認で動くワークフローの版 | \`${SHA:0:7}\` |"
+            echo
+            echo "承認は[実行の画面]($RUN_URL)の「Review deployments」から行います。"
+          } > "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$ERR" ]; then
+            gh issue comment "$ISSUE" --repo "$REPO" --body-file "$out"
+          fi
 
   reject:
     needs: check
