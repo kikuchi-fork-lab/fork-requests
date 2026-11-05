@@ -1,6 +1,7 @@
 # フォークの申請を、管理者の承認の後に処理する。
 # 流れ：Issue の様式で申請 → 申請者が Org のメンバーかと書式を確かめ、起点の版を引く → Environment fork-approval の承認者が承認
 #       → App の権限でフォーク元のフォークを有効にし、フォークを作り、無効に戻し、起点のタグとブランチを写し、
+#         既定のブランチを作業のブランチに切り替えて写ってきた既定のブランチを消し、
 #         チームと申請者に権限を付ける → 結果を Issue に書いて閉じる。
 # App の権限：Administration と Contents（タグとブランチを作る）の書き込み、Issues の書き込み、Org の Members の書き込み。
 # Issue の本文は誰でも書けるため、${{ }} で run の中へ直接埋めず、環境変数で渡して検査してから使う。
@@ -325,6 +326,19 @@ jobs:
           fi
           if [ -n "$WORK" ] && [ "$WORK" != "$BASE" ]; then
             mkref "refs/heads/$WORK"
+          fi
+
+          # 新しいフォークの既定のブランチを作業のブランチ（無ければ起点のブランチ）に切り替え、
+          # フォークを作るときに写ってきたフォーク元の既定のブランチを消す。
+          # クローンや PR の既定の向き先を作業のブランチにし、取り違えを防ぐため。
+          target="${WORK:-}"
+          if [ -z "$target" ] && [ "$BASE_KIND" = branch ]; then target="$BASE"; fi
+          copied=$(gh api "repos/$ORG/$FORK" --jq .default_branch)
+          if [ -n "$target" ] && [ "$target" != "$copied" ]; then
+            gh api -X PATCH "repos/$ORG/$FORK" -f default_branch="$target" >/dev/null
+            log "- 既定のブランチを $target に切り替えた"
+            gh api -X DELETE "repos/$ORG/$FORK/git/refs/heads/$copied" >/dev/null
+            log "- フォーク元から写ってきた $copied を消した"
           fi
 
           gh api -X PUT "orgs/$ORG/teams/$TEAM/repos/$ORG/$FORK" -f permission=push >/dev/null
