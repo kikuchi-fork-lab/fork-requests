@@ -1,7 +1,8 @@
 # フォークの申請を、管理者の承認の後に処理する。
-# 流れ：Issue の様式で申請 → 申請者が Org のメンバーかと書式を確かめる → Environment fork-approval の承認者が承認
-#       → App の権限でフォーク元のフォークを有効にし、フォークを作り、無効に戻し、チームと申請者に権限を付ける
-#       → 結果を Issue に書いて閉じる。
+# 流れ：Issue の様式で申請 → 申請者が Org のメンバーかと書式を確かめ、起点の版を引く → Environment fork-approval の承認者が承認
+#       → App の権限でフォーク元のフォークを有効にし、フォークを作り、無効に戻し、起点のタグとブランチを写し、
+#         チームと申請者に権限を付ける → 結果を Issue に書いて閉じる。
+# App の権限：Administration と Contents（タグとブランチを作る）の書き込み、Issues の書き込み、Org の Members の書き込み。
 # Issue の本文は誰でも書けるため、${{ }} で run の中へ直接埋めず、環境変数で渡して検査してから使う。
 # 外部のアクションは使わない（App のトークンは openssl で JWT を作って取る）。
 name: フォークの申請の処理
@@ -26,7 +27,11 @@ jobs:
       team: ${{ steps.parse.outputs.team }}
       requester_role: ${{ steps.parse.outputs.requester_role }}
       expires: ${{ steps.parse.outputs.expires }}
-      error: ${{ steps.parse.outputs.error }}
+      base_ref: ${{ steps.parse.outputs.base_ref }}
+      work_branch: ${{ steps.parse.outputs.work_branch }}
+      base_kind: ${{ steps.resolve.outputs.base_kind }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      error: ${{ steps.parse.outputs.error }}${{ steps.resolve.outputs.error }}
     steps:
       # Issue の author_association は、Org のメンバーの公開を非公開にしている人を CONTRIBUTOR と返すため使えない。
       # App の権限で Org にメンバーかを問い合わせる。
@@ -80,8 +85,12 @@ jobs:
               "team": get("権限を付けるチーム"),
               "requester_role": get("申請者に付ける権限"),
               "expires": get("使う期限"),
+              "base_ref": get("起点のブランチかタグ"),
+              "work_branch": get("作業のブランチの名前").replace("_No response_", "").strip(),
           }
           name_re = r"^[A-Za-z0-9._-]{1,100}$"
+          # git の参照名として通る形だけを受ける（スラッシュは可、.. や先頭・末尾のスラッシュは不可）
+          ref_re = r"^(?!.*\.\.)(?!/)(?!.*/$)(?!.*//)[A-Za-z0-9._/-]{1,200}$"
           err = []
           if os.environ.get("IS_MEMBER") != "yes":
               err.append("申請者がこの Org のメンバーではありません")
@@ -94,13 +103,46 @@ jobs:
               err.append("使う期限は YYYY-MM-DD で書きます")
           if v["source"] == v["fork_name"]:
               err.append("フォークの名前がフォーク元と同じです")
+          if not re.match(ref_re, v["base_ref"]):
+              err.append("起点のブランチかタグの書式が正しくありません")
+          if v["work_branch"] and not re.match(ref_re, v["work_branch"]):
+              err.append("作業のブランチの名前の書式が正しくありません")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               for k, val in v.items():
-                  f.write(f"{k}={val if re.match(r'^[A-Za-z0-9._-]*$', val) else ''}\n")
+                  f.write(f"{k}={val if re.match(r'^[A-Za-z0-9._/-]*$', val) else ''}\n")
               f.write(f"error={' / '.join(err)}\n")
           print("確かめた値:", v)
           print("問題:", err or "なし")
           PY
+
+      # 起点がフォーク元のブランチかタグかを見分け、指す版（コミット）の番号を決める。
+      # 作成の段はこの番号で作るため、承認の後にフォーク元のタグやブランチが動いても、承認者が表で見た版とずれない。
+      - name: 起点を引く
+        id: resolve
+        if: steps.parse.outputs.error == ''
+        env:
+          GH_TOKEN: ${{ steps.member.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          SOURCE: ${{ steps.parse.outputs.source }}
+          BASE: ${{ steps.parse.outputs.base_ref }}
+          WORK: ${{ steps.parse.outputs.work_branch }}
+        run: |
+          set -uo pipefail
+          kind=""; sha=""; err=""
+          if obj=$(gh api "repos/$ORG/$SOURCE/git/ref/heads/$BASE" --jq '.object.sha' 2>/dev/null) && [ -n "$obj" ]; then
+            kind=branch; sha=$obj
+          elif obj=$(gh api "repos/$ORG/$SOURCE/git/ref/tags/$BASE" --jq '"\(.object.type) \(.object.sha)"' 2>/dev/null) && [ -n "$obj" ]; then
+            kind=tag; sha=${obj#* }
+            # 注釈付きのタグはタグの実体を指すため、その先のコミットまでたどる
+            if [ "${obj%% *}" = tag ]; then sha=$(gh api "repos/$ORG/$SOURCE/git/tags/$sha" --jq '.object.sha'); fi
+          else
+            err="起点 $BASE がフォーク元 $SOURCE のブランチにもタグにもありません"
+          fi
+          if [ "$kind" = tag ] && [ -z "$WORK" ]; then
+            err="起点がタグのときは、作業のブランチの名前が要ります"
+          fi
+          echo "起点：$BASE（$kind）→ $sha"
+          { echo "base_kind=$kind"; echo "base_sha=$sha"; echo "error=$err"; } >> "$GITHUB_OUTPUT"
 
       # 承認者が実行の画面だけで判断できるよう、使う値と権限を受ける人を要約と Issue に書き出す。
       # 承認の判断は Issue の今の本文ではなく、この表で行う（本文は後から書き換えられるが、処理に使うのは申請したときの本文）。
@@ -117,7 +159,11 @@ jobs:
           TEAM: ${{ steps.parse.outputs.team }}
           ROLE: ${{ steps.parse.outputs.requester_role }}
           EXPIRES: ${{ steps.parse.outputs.expires }}
-          ERR: ${{ steps.parse.outputs.error }}
+          BASE: ${{ steps.parse.outputs.base_ref }}
+          WORK: ${{ steps.parse.outputs.work_branch }}
+          BASE_KIND: ${{ steps.resolve.outputs.base_kind }}
+          BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
+          ERR: ${{ steps.parse.outputs.error }}${{ steps.resolve.outputs.error }}
           SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -144,6 +190,9 @@ jobs:
             echo "| 申請者 | $REQUESTER（Org のメンバー：$IS_MEMBER） |"
             echo "| フォーク元 | $ORG/$SOURCE（$src_info） |"
             echo "| フォークの名前 | $ORG/$FORK（$fork_exists） |"
+            case "$BASE_KIND" in branch) kind_ja="ブランチ";; tag) kind_ja="タグ";; *) kind_ja="不明";; esac
+            echo "| 起点 | $BASE（$kind_ja、版 \`${BASE_SHA:0:7}\`） |"
+            echo "| 作業のブランチ | ${WORK:-作らない} |"
             echo "| 書き込みの権限を受けるチーム | $TEAM |"
             echo "| チームのメンバー | $members |"
             echo "| 申請者に付ける権限 | $ROLE |"
@@ -213,9 +262,27 @@ jobs:
           TEAM: ${{ needs.check.outputs.team }}
           ROLE: ${{ needs.check.outputs.requester_role }}
           REQUESTER: ${{ github.event.issue.user.login }}
+          BASE: ${{ needs.check.outputs.base_ref }}
+          WORK: ${{ needs.check.outputs.work_branch }}
+          BASE_KIND: ${{ needs.check.outputs.base_kind }}
+          BASE_SHA: ${{ needs.check.outputs.base_sha }}
         run: |
           set -euo pipefail
           log() { echo "$1" | tee -a "$RUNNER_TEMP/result.md"; }
+          # 新しいフォークに参照（タグかブランチ）を作る。フォークは非同期に作られるため、作れるまで数回やり直す。
+          mkref() {
+            local ref=$1
+            if gh api "repos/$ORG/$FORK/git/$(echo "$ref" | sed 's#^refs/#ref/#')" >/dev/null 2>&1; then
+              log "- ${ref#refs/} はすでにある"; return 0
+            fi
+            for i in $(seq 1 10); do
+              if gh api -X POST "repos/$ORG/$FORK/git/refs" -f ref="$ref" -f sha="$BASE_SHA" >/dev/null 2>"$RUNNER_TEMP/err"; then
+                log "- ${ref#refs/} を作った（版 ${BASE_SHA:0:7}）"; return 0
+              fi
+              sleep 3
+            done
+            log "- ${ref#refs/} を作れなかった：$(head -c 300 "$RUNNER_TEMP/err")"; return 1
+          }
           vis=$(gh api "repos/$ORG/$SOURCE" --jq .visibility)
           log "- フォーク元：$ORG/$SOURCE（$vis）"
           if gh api "repos/$ORG/$FORK" >/dev/null 2>&1; then
@@ -248,6 +315,17 @@ jobs:
           gh api "repos/$ORG/$FORK" --jq '"- フォークを作った：\(.html_url)（親：\(.parent.full_name)）"' | tee -a "$RUNNER_TEMP/result.md"
 
           restore; trap - EXIT
+
+          # 起点を写す。タグならタグと作業のブランチ、ブランチなら同じ名前のブランチと（指定があれば）作業のブランチ。
+          # 版はフォーク元にしか無くてもよい（同じフォークのつながりの中でオブジェクトを共有している前提。検証で確かめる）。
+          if [ "$BASE_KIND" = tag ]; then
+            mkref "refs/tags/$BASE"
+          else
+            mkref "refs/heads/$BASE"
+          fi
+          if [ -n "$WORK" ] && [ "$WORK" != "$BASE" ]; then
+            mkref "refs/heads/$WORK"
+          fi
 
           gh api -X PUT "orgs/$ORG/teams/$TEAM/repos/$ORG/$FORK" -f permission=push >/dev/null
           log "- チーム $TEAM に書き込みの権限を付けた"

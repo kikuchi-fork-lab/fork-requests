@@ -17,6 +17,20 @@ body:
       description: フォーク元の名前に用途を付ける（例：source-repo_1ROM）。英数字・ハイフン・下線・ピリオドだけ
     validations:
       required: true
+  - type: input
+    id: base_ref
+    attributes:
+      label: 起点のブランチかタグ
+      description: フォーク元のブランチ名かタグ名（例：IT6_2.9.1_20260803_G00-V1-00）。新しいフォークに同じ名前で写す
+    validations:
+      required: true
+  - type: input
+    id: work_branch
+    attributes:
+      label: 作業のブランチの名前
+      description: 起点の版から始まるブランチを、この名前で新しいフォークに作る（例：1rom/eagle）。起点がタグのときは必須
+    validations:
+      required: false
   - type: textarea
     id: purpose
     attributes:
