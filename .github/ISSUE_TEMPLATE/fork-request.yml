@@ -1,0 +1,48 @@
+name: フォークの申請
+description: Org の中にフォークを作る申請。管理者が承認すると自動で作られる
+title: "フォークの申請："
+labels: ["fork-request"]
+body:
+  - type: input
+    id: source
+    attributes:
+      label: フォーク元のリポジトリ
+      description: この Org の中のリポジトリの名前だけを書く（例：source-repo）
+    validations:
+      required: true
+  - type: input
+    id: fork_name
+    attributes:
+      label: フォークの名前
+      description: フォーク元の名前に用途を付ける（例：source-repo_1ROM）。英数字・ハイフン・下線・ピリオドだけ
+    validations:
+      required: true
+  - type: textarea
+    id: purpose
+    attributes:
+      label: 用途
+    validations:
+      required: true
+  - type: input
+    id: team
+    attributes:
+      label: 権限を付けるチーム
+      description: この Org のチームの名前（例：reviewers）。書き込みの権限を付ける
+    validations:
+      required: true
+  - type: dropdown
+    id: requester_role
+    attributes:
+      label: 申請者に付ける権限
+      options:
+        - maintain
+        - admin
+    validations:
+      required: true
+  - type: input
+    id: expires
+    attributes:
+      label: 使う期限
+      description: YYYY-MM-DD
+    validations:
+      required: true

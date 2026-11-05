@@ -1,0 +1,186 @@
+# フォークの申請を、管理者の承認の後に処理する。
+# 流れ：Issue の様式で申請 → 申請者が Org のメンバーかと書式を確かめる → Environment fork-approval の承認者が承認
+#       → App の権限でフォーク元のフォークを有効にし、フォークを作り、無効に戻し、チームと申請者に権限を付ける
+#       → 結果を Issue に書いて閉じる。
+# Issue の本文は誰でも書けるため、${{ }} で run の中へ直接埋めず、環境変数で渡して検査してから使う。
+# 外部のアクションは使わない（App のトークンは openssl で JWT を作って取る）。
+name: フォークの申請の処理
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-request
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: contains(github.event.issue.labels.*.name, 'fork-request')
+    runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.parse.outputs.source }}
+      fork_name: ${{ steps.parse.outputs.fork_name }}
+      team: ${{ steps.parse.outputs.team }}
+      requester_role: ${{ steps.parse.outputs.requester_role }}
+      expires: ${{ steps.parse.outputs.expires }}
+      error: ${{ steps.parse.outputs.error }}
+    steps:
+      - name: 申請の書式と申請者を確かめる
+        id: parse
+        env:
+          BODY: ${{ github.event.issue.body }}
+          ASSOC: ${{ github.event.issue.author_association }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          body = os.environ.get("BODY", "")
+          fields, key = {}, None
+          for line in body.splitlines():
+              m = re.match(r"^###\s+(.*)$", line)
+              if m:
+                  key = m.group(1).strip(); fields[key] = []; continue
+              if key is not None:
+                  fields[key].append(line)
+          get = lambda k: "\n".join(fields.get(k, [])).strip()
+          v = {
+              "source": get("フォーク元のリポジトリ"),
+              "fork_name": get("フォークの名前"),
+              "team": get("権限を付けるチーム"),
+              "requester_role": get("申請者に付ける権限"),
+              "expires": get("使う期限"),
+          }
+          name_re = r"^[A-Za-z0-9._-]{1,100}$"
+          err = []
+          if os.environ.get("ASSOC") not in ("OWNER", "MEMBER"):
+              err.append("申請者がこの Org のメンバーではありません")
+          for k in ("source", "fork_name", "team"):
+              if not re.match(name_re, v[k]):
+                  err.append(f"{k} の書式が正しくありません")
+          if v["requester_role"] not in ("maintain", "admin"):
+              err.append("申請者に付ける権限は maintain か admin です")
+          if not re.match(r"^\d{4}-\d{2}-\d{2}$", v["expires"]):
+              err.append("使う期限は YYYY-MM-DD で書きます")
+          if v["source"] == v["fork_name"]:
+              err.append("フォークの名前がフォーク元と同じです")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              for k, val in v.items():
+                  f.write(f"{k}={val if re.match(r'^[A-Za-z0-9._-]*$', val) else ''}\n")
+              f.write(f"error={' / '.join(err)}\n")
+          print("確かめた値:", v)
+          print("問題:", err or "なし")
+          PY
+
+  reject:
+    needs: check
+    if: needs.check.outputs.error != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: 申請を差し戻す
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ERR: ${{ needs.check.outputs.error }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$REPO" --body "申請を差し戻しました：$ERR"
+          gh issue close "$ISSUE" --repo "$REPO" --reason "not planned"
+
+  create:
+    needs: check
+    if: needs.check.outputs.error == ''
+    runs-on: ubuntu-latest
+    environment: fork-approval
+    steps:
+      - name: App のトークンを取る
+        id: token
+        env:
+          APP_ID: ${{ vars.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now=$(date +%s)
+          header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
+          payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now-60)) $((now+540)) "$APP_ID" | b64)
+          keyfile=$(mktemp); printf '%s' "$APP_PRIVATE_KEY" > "$keyfile"
+          sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign "$keyfile" | b64)
+          rm -f "$keyfile"
+          jwt="$header.$payload.$sig"
+          api() { curl -fsS -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" "$@"; }
+          inst=$(api "https://api.github.com/orgs/$ORG/installation" | jq -r .id)
+          tok=$(api -X POST "https://api.github.com/app/installations/$inst/access_tokens" | jq -r .token)
+          echo "::add-mask::$tok"
+          echo "token=$tok" >> "$GITHUB_OUTPUT"
+
+      - name: フォークを作り、権限を付ける
+        id: fork
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          SOURCE: ${{ needs.check.outputs.source }}
+          FORK: ${{ needs.check.outputs.fork_name }}
+          TEAM: ${{ needs.check.outputs.team }}
+          ROLE: ${{ needs.check.outputs.requester_role }}
+          REQUESTER: ${{ github.event.issue.user.login }}
+        run: |
+          set -euo pipefail
+          log() { echo "$1" | tee -a "$RUNNER_TEMP/result.md"; }
+          vis=$(gh api "repos/$ORG/$SOURCE" --jq .visibility)
+          log "- フォーク元：$ORG/$SOURCE（$vis）"
+          if gh api "repos/$ORG/$FORK" >/dev/null 2>&1; then
+            log "- 同じ名前のリポジトリ $ORG/$FORK がすでにあります"; exit 1
+          fi
+          gh api "orgs/$ORG/teams/$TEAM" >/dev/null || { log "- チーム $TEAM がありません"; exit 1; }
+
+          # フォークの許可を入れる。公開のリポジトリはフォークを止められないため、切り替えは非公開のときだけ。
+          toggled=no
+          if [ "$vis" != "public" ]; then
+            gh api -X PATCH "repos/$ORG/$SOURCE" -F allow_forking=true >/dev/null
+            toggled=yes
+            log "- フォーク元のフォークを有効にした"
+          else
+            log "- フォーク元は公開のため、フォークの有効・無効の切り替えは飛ばした"
+          fi
+
+          restore() {
+            if [ "$toggled" = yes ]; then
+              gh api -X PATCH "repos/$ORG/$SOURCE" -F allow_forking=false >/dev/null && log "- フォーク元のフォークを無効に戻した"
+            fi
+          }
+          trap restore EXIT
+
+          gh api -X POST "repos/$ORG/$SOURCE/forks" -f organization="$ORG" -f name="$FORK" -F default_branch_only=true >/dev/null
+          for i in $(seq 1 30); do
+            gh api "repos/$ORG/$FORK" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          gh api "repos/$ORG/$FORK" --jq '"- フォークを作った：\(.html_url)（親：\(.parent.full_name)）"' | tee -a "$RUNNER_TEMP/result.md"
+
+          restore; trap - EXIT
+
+          gh api -X PUT "orgs/$ORG/teams/$TEAM/repos/$ORG/$FORK" -f permission=push >/dev/null
+          log "- チーム $TEAM に書き込みの権限を付けた"
+          gh api -X PUT "repos/$ORG/$FORK/collaborators/$REQUESTER" -f permission="$ROLE" >/dev/null
+          log "- 申請者 $REQUESTER に $ROLE の権限を付けた"
+
+      - name: 結果を Issue に書く
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          OUTCOME: ${{ steps.fork.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          touch "$RUNNER_TEMP/result.md"
+          if [ "$OUTCOME" = success ]; then head="フォークを作りました。"; else head="フォークの作成に失敗しました（[実行の記録]($RUN_URL)）。"; fi
+          { echo "$head"; echo; cat "$RUNNER_TEMP/result.md"; } > "$RUNNER_TEMP/comment.md"
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file "$RUNNER_TEMP/comment.md"
+          if [ "$OUTCOME" = success ]; then gh issue close "$ISSUE" --repo "$REPO" --reason completed; fi
