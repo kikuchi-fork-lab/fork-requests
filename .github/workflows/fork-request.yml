@@ -127,7 +127,7 @@ jobs:
           if [ -n "$SOURCE" ]; then
             src_info=$(gh api "repos/$ORG/$SOURCE" --jq '"\(.visibility)、既定のブランチ \(.default_branch)"' 2>/dev/null || echo "見つからない")
           fi
-          fork_exists="無し"
+          fork_exists="同じ名前のリポジトリは無い"
           if [ -n "$FORK" ] && gh api "repos/$ORG/$FORK" >/dev/null 2>&1; then fork_exists="同じ名前のリポジトリがすでにある"; fi
           members="（チームが見つからない）"
           if [ -n "$TEAM" ] && m=$(gh api "orgs/$ORG/teams/$TEAM/members?per_page=100" --jq '[.[].login] | join("、")' 2>/dev/null); then
