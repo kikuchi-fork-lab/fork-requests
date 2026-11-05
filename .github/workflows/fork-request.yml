@@ -29,11 +29,39 @@ jobs:
       expires: ${{ steps.parse.outputs.expires }}
       error: ${{ steps.parse.outputs.error }}
     steps:
-      - name: 申請の書式と申請者を確かめる
+      # Issue の author_association は、Org のメンバーの公開を非公開にしている人を CONTRIBUTOR と返すため使えない。
+      # App の権限で Org にメンバーかを問い合わせる。
+      - name: 申請者が Org のメンバーかを問い合わせる
+        id: member
+        env:
+          APP_ID: ${{ vars.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          ORG: ${{ github.repository_owner }}
+          REQUESTER: ${{ github.event.issue.user.login }}
+        run: |
+          set -euo pipefail
+          b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now=$(date +%s)
+          header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
+          payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now-60)) $((now+540)) "$APP_ID" | b64)
+          keyfile=$(mktemp); printf '%s' "$APP_PRIVATE_KEY" > "$keyfile"
+          sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign "$keyfile" | b64)
+          rm -f "$keyfile"
+          jwt="$header.$payload.$sig"
+          api() { curl -fsS -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" "$@"; }
+          inst=$(api "https://api.github.com/orgs/$ORG/installation" | jq -r .id)
+          tok=$(api -X POST "https://api.github.com/app/installations/$inst/access_tokens" | jq -r .token)
+          echo "::add-mask::$tok"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/$ORG/members/$REQUESTER")
+          echo "Org への問い合わせの応答：$code"
+          if [ "$code" = 204 ]; then echo "is_member=yes" >> "$GITHUB_OUTPUT"; else echo "is_member=no" >> "$GITHUB_OUTPUT"; fi
+
+      - name: 申請の書式を確かめる
         id: parse
         env:
           BODY: ${{ github.event.issue.body }}
-          ASSOC: ${{ github.event.issue.author_association }}
+          IS_MEMBER: ${{ steps.member.outputs.is_member }}
         run: |
           python3 - <<'PY'
           import os, re
@@ -55,7 +83,7 @@ jobs:
           }
           name_re = r"^[A-Za-z0-9._-]{1,100}$"
           err = []
-          if os.environ.get("ASSOC") not in ("OWNER", "MEMBER"):
+          if os.environ.get("IS_MEMBER") != "yes":
               err.append("申請者がこの Org のメンバーではありません")
           for k in ("source", "fork_name", "team"):
               if not re.match(name_re, v[k]):
